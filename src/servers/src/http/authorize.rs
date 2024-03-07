@@ -146,7 +146,7 @@ pub fn extract_catalog_and_schema<B>(request: &Request<B>) -> (&str, &str) {
         .or_else(|| {
             let query = request.uri().query().unwrap_or_default();
             if is_influxdb_v2_request(request) {
-                extract_bucket_from_query(query).or_else(|| extract_db_from_query(query))
+                extract_db_from_query(query).or_else(|| extract_bucket_from_query(query))
             } else {
                 extract_db_from_query(query)
             }
