@@ -98,6 +98,14 @@ const DEFAULT_BODY_LIMIT: ReadableSize = ReadableSize::mb(64);
 // TODO(fys): This is a temporary workaround, it will be improved later
 pub static PUBLIC_APIS: [&str; 2] = ["/v1/influxdb/ping", "/v1/influxdb/health"];
 
+fn is_influxdb_request<T>(req: &hyper::Request<T>) -> bool {
+    req.uri().path().contains("influxdb")
+}
+
+fn is_influxdb_v2_request<T>(req: &hyper::Request<T>) -> bool {
+    req.uri().path().contains("influxdb/api/v2")
+}
+
 #[derive(Default)]
 pub struct HttpServer {
     router: StdMutex<Router>,

@@ -33,7 +33,7 @@ use session::context::QueryContextBuilder;
 use snafu::{ensure, OptionExt, ResultExt};
 
 use super::header::{GreptimeDbName, GREPTIME_TIMEZONE_HEADER_NAME};
-use super::{ResponseFormat, PUBLIC_APIS};
+use super::{ResponseFormat, PUBLIC_APIS, is_influxdb_request, is_influxdb_v2_request};
 use crate::error::{
     self, InvalidAuthorizationHeaderSnafu, InvalidParameterSnafu, InvisibleASCIISnafu,
     NotFoundInfluxAuthSnafu, Result, UnsupportedAuthSchemeSnafu, UrlDecodeSnafu,
@@ -59,13 +59,7 @@ pub async fn inner_auth<B>(
     mut req: Request<B>,
 ) -> std::result::Result<Request<B>, Response> {
     // 1. prepare
-    let is_influxdb = req.uri().path().contains("influxdb");
-    let (catalog, schema) = if is_influxdb {
-        let dbname = parse_db_name_from_query_string(&req);
-        parse_catalog_and_schema_from_db_string(dbname)
-    } else {
-        extract_catalog_and_schema(&req)
-    };
+    let (catalog, schema) = extract_catalog_and_schema(&req);
     // TODO(ruihang): move this out of auth module
     let timezone = Arc::new(extract_timezone(&req));
     let query_ctx_builder = QueryContextBuilder::default()
@@ -86,14 +80,14 @@ pub async fn inner_auth<B>(
     };
 
     // 3. get username and pwd
-    let (username, password) = match extract_username_and_password(is_influxdb, &req) {
+    let (username, password) = match extract_username_and_password(&req) {
         Ok((username, password)) => (username, password),
         Err(e) => {
             warn!("extract username and password failed: {}", e);
             crate::metrics::METRIC_AUTH_FAILURE
                 .with_label_values(&[e.status_code().as_ref()])
                 .inc();
-            return Err(err_response(is_influxdb, e).into_response());
+            return Err(err_response(is_influxdb_request(&req), e).into_response());
         }
     };
 
@@ -117,14 +111,9 @@ pub async fn inner_auth<B>(
             crate::metrics::METRIC_AUTH_FAILURE
                 .with_label_values(&[e.status_code().as_ref()])
                 .inc();
-            Err(err_response(is_influxdb, e).into_response())
+            Err(err_response(is_influxdb_request(&req), e).into_response())
         }
     }
-}
-
-fn parse_db_name_from_query_string<B>(req: &Request<B>) -> &str {
-    let query_str = &req.uri().query().unwrap_or_default();
-    extract_db_from_query(query_str).unwrap_or(DEFAULT_SCHEMA_NAME)
 }
 
 pub async fn check_http_auth<B>(
@@ -156,9 +145,12 @@ pub fn extract_catalog_and_schema<B>(request: &Request<B>) -> (&str, &str) {
         .and_then(|header| header.to_str().ok())
         .or_else(|| {
             let query = request.uri().query().unwrap_or_default();
-            extract_db_from_query(query)
-        })
-        .unwrap_or(DEFAULT_SCHEMA_NAME);
+            if is_influxdb_v2_request(request) {
+                extract_bucket_from_query(query).or_else(|| extract_db_from_query(query))
+            } else {
+                extract_db_from_query(query)
+            }
+        }).unwrap_or(DEFAULT_SCHEMA_NAME);
 
     parse_catalog_and_schema_from_db_string(dbname)
 }
@@ -219,10 +211,9 @@ fn get_influxdb_credentials<B>(request: &Request<B>) -> Result<Option<(Username,
 }
 
 pub fn extract_username_and_password<B>(
-    is_influxdb: bool,
     request: &Request<B>,
 ) -> Result<(Username, Password)> {
-    Ok(if is_influxdb {
+    Ok(if is_influxdb_request(request) {
         // compatible with influxdb auth
         get_influxdb_credentials(request)?.context(NotFoundInfluxAuthSnafu)?
     } else {
@@ -305,12 +296,15 @@ fn extract_db_from_query(query: &str) -> Option<&str> {
         if let Some(db) = pair.strip_prefix("db=") {
             return if db.is_empty() { None } else { Some(db) };
         }
-        if let Some(bucket) = pair.strip_prefix("bucket=") {
-            return if bucket.is_empty() {
-                None
-            } else {
-                Some(bucket)
-            };
+    }
+    None
+}
+
+// NOTE: InfluxDB v2 uses "bucket" instead of "db"
+fn extract_bucket_from_query(query: &str) -> Option<&str> {
+    for pair in query.split('&') {
+        if let Some(db) = pair.strip_prefix("bucket=") {
+            return if db.is_empty() { None } else { Some(db) };
         }
     }
     None
@@ -441,11 +435,12 @@ mod tests {
         assert_matches!(extract_db_from_query("db="), None);
         assert_matches!(extract_db_from_query("bucket="), None);
         assert_matches!(extract_db_from_query("db=foo"), Some("foo"));
-        assert_matches!(extract_db_from_query("bucket=foo"), Some("foo"));
         assert_matches!(extract_db_from_query("name=bar"), None);
         assert_matches!(extract_db_from_query("db=&name=bar"), None);
         assert_matches!(extract_db_from_query("db=foo&name=bar"), Some("foo"));
         assert_matches!(extract_db_from_query("db=foo&bucket=bar"), Some("foo"));
+        assert_matches!(extract_db_from_query("bucket=foo"), None);
+        assert_matches!(extract_bucket_from_query("bucket=foo"), Some("foo"));
         assert_matches!(extract_db_from_query("name=bar&db="), None);
         assert_matches!(extract_db_from_query("name=bar&db=foo"), Some("foo"));
         assert_matches!(extract_db_from_query("name=bar&db=&name=bar"), None);
